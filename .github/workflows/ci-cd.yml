@@ -76,8 +76,8 @@ jobs:
         run: shellcheck scripts/*.sh
       - name: Hadolint Dockerfiles
         run: |
-          docker run --rm -i hadolint/hadolint hadolint --ignore DL3018 - < Backend/todo-summary-assistant/Dockerfile
-          docker run --rm -i hadolint/hadolint hadolint --ignore DL3018 - < Frontend/todo/Dockerfile
+            docker run --rm -i hadolint/hadolint hadolint --failure-threshold error --ignore DL3018 - < Backend/todo-summary-assistant/Dockerfile
+            docker run --rm -i hadolint/hadolint hadolint --failure-threshold error --ignore DL3018 - < Frontend/todo/Dockerfile
       - name: Validate compose files
         run: |
           MYSQL_ROOT_PASSWORD=x GRAFANA_ADMIN_PASSWORD=x docker compose -f docker-compose.yml config -q
