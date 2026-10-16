@@ -1,0 +1,90 @@
+# Prometheus alert rules. Every alert is actionable; see MONITORING_AND_OPERATIONS.md.
+# Grafana shows these under Alerting > Alert rules (data-source managed) and on the dashboard.
+groups:
+  - name: todo-app
+    rules:
+      - alert: BackendDown
+        expr: up{job="todo-backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Todo backend is down"
+          description: "Prometheus cannot scrape the backend for more than 1 minute (crash, deploy failure or network issue)."
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_server_requests_seconds_count{job="todo-backend",status=~"5..",uri!~"/actuator.*"}[5m]))
+            /
+            sum(rate(http_server_requests_seconds_count{job="todo-backend",uri!~"/actuator.*"}[5m]))
+          ) > 0.05
+          and
+          sum(rate(http_server_requests_seconds_count{job="todo-backend",uri!~"/actuator.*"}[5m])) > 0.02
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "More than 5% of requests are failing (5xx)"
+          description: "5xx ratio is {{ $value | humanizePercentage }} over the last 5 minutes (alert ignores near-zero traffic)."
+
+      - alert: HighLatencyP95
+        # /summarize calls Cohere + Slack and is legitimately slow, so it is excluded to avoid noise
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(http_server_requests_seconds_bucket{job="todo-backend",uri!~"/actuator.*|/api/todos/summarize"}[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p95 API latency above 1s"
+          description: "p95 latency is {{ $value | humanizeDuration }} for 10 minutes."
+
+      - alert: DatabaseConnectionTimeouts
+        expr: increase(hikaricp_connections_timeout_total{job="todo-backend"}[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend cannot get DB connections (RDS unreachable or saturated)"
+          description: "Hikari connection timeouts observed in the last 5 minutes. Check RDS status, security group and credentials."
+
+  - name: host-and-containers
+    rules:
+      - alert: HostHighCPU
+        expr: 100 - (avg(rate(node_cpu_seconds_total{job="node-exporter",mode="idle"}[5m])) * 100) > 85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host CPU above 85% for 10 minutes"
+          description: "CPU usage is {{ $value | printf \"%.0f\" }}%. On burstable instances also check CPU credits."
+
+      - alert: HostLowDisk
+        expr: |
+          (node_filesystem_avail_bytes{job="node-exporter",mountpoint="/",fstype!~"tmpfs|overlay|squashfs"}
+           / node_filesystem_size_bytes{job="node-exporter",mountpoint="/",fstype!~"tmpfs|overlay|squashfs"}) * 100 < 15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Less than 15% disk space left on /"
+          description: "{{ $value | printf \"%.1f\" }}% free. Prune images/logs or grow the EBS volume."
+
+      - alert: HostLowMemory
+        expr: (node_memory_MemAvailable_bytes{job="node-exporter"} / node_memory_MemTotal_bytes{job="node-exporter"}) * 100 < 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Less than 10% memory available"
+          description: "{{ $value | printf \"%.1f\" }}% available - risk of OOM kills."
+
+      - alert: ContainerCrashLoop
+        expr: changes(container_start_time_seconds{job="cadvisor",name=~"todo-.+"}[15m]) > 2
+        labels:
+          severity: critical
+        annotations:
+          summary: "Container {{ $labels.name }} restarted more than twice in 15 minutes"
+          description: "Crash loop suspected. Run 'docker logs {{ $labels.name }}' on the host."

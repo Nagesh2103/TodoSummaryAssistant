@@ -1,0 +1,119 @@
+# Unit tests for alert-rules.yml  ->  promtool test rules monitoring/alert-rules.test.yml
+rule_files:
+  - alert-rules.yml
+evaluation_interval: 1m
+
+tests:
+  # --- BackendDown fires after 1m of failed scrapes, and not while healthy
+  - interval: 1m
+    input_series:
+      - series: 'up{job="todo-backend"}'
+        values: '1 1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: BackendDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: BackendDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: todo-backend
+            exp_annotations:
+              summary: "Todo backend is down"
+              description: "Prometheus cannot scrape the backend for more than 1 minute (crash, deploy failure or network issue)."
+
+  # --- HighErrorRate: 50% of traffic is 5xx for >5m
+  - interval: 1m
+    input_series:
+      - series: 'http_server_requests_seconds_count{job="todo-backend",status="200",uri="/api/todos"}'
+        values: '0+60x20'
+      - series: 'http_server_requests_seconds_count{job="todo-backend",status="500",uri="/api/todos"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "More than 5% of requests are failing (5xx)"
+              description: "5xx ratio is 50% over the last 5 minutes (alert ignores near-zero traffic)."
+
+  # --- HighErrorRate must stay quiet for a healthy service (no noise)
+  - interval: 1m
+    input_series:
+      - series: 'http_server_requests_seconds_count{job="todo-backend",status="200",uri="/api/todos"}'
+        values: '0+60x20'
+      - series: 'http_server_requests_seconds_count{job="todo-backend",status="500",uri="/api/todos"}'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HighErrorRate
+        exp_alerts: []
+
+  # --- HighErrorRate must ignore a single error on near-zero traffic
+  - interval: 1m
+    input_series:
+      - series: 'http_server_requests_seconds_count{job="todo-backend",status="200",uri="/api/todos"}'
+        values: '0x20'
+      - series: 'http_server_requests_seconds_count{job="todo-backend",status="500",uri="/api/todos"}'
+        values: '0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 18m
+        alertname: HighErrorRate
+        exp_alerts: []
+
+  # --- HostLowDisk: 10% free on / for >10m
+  - interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="node-exporter",mountpoint="/",fstype="xfs"}'
+        values: '10x20'
+      - series: 'node_filesystem_size_bytes{job="node-exporter",mountpoint="/",fstype="xfs"}'
+        values: '100x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HostLowDisk
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: node-exporter
+              mountpoint: "/"
+              fstype: xfs
+            exp_annotations:
+              summary: "Less than 15% disk space left on /"
+              description: "10.0% free. Prune images/logs or grow the EBS volume."
+
+  # --- ContainerCrashLoop: start time changes 3 times in 15m
+  - interval: 1m
+    input_series:
+      - series: 'container_start_time_seconds{job="cadvisor",name="todo-backend"}'
+        values: '100 100 200 200 300 300 400 400 400'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ContainerCrashLoop
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: cadvisor
+              name: todo-backend
+            exp_annotations:
+              summary: "Container todo-backend restarted more than twice in 15 minutes"
+              description: "Crash loop suspected. Run 'docker logs todo-backend' on the host."
+
+  # --- DatabaseConnectionTimeouts
+  - interval: 1m
+    input_series:
+      - series: 'hikaricp_connections_timeout_total{job="todo-backend",pool="HikariPool-1"}'
+        values: '0 0 0 1 3 5 7 9 11 13'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: DatabaseConnectionTimeouts
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: todo-backend
+              pool: HikariPool-1
+            exp_annotations:
+              summary: "Backend cannot get DB connections (RDS unreachable or saturated)"
+              description: "Hikari connection timeouts observed in the last 5 minutes. Check RDS status, security group and credentials."

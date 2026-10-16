@@ -1,0 +1,132 @@
+# Local full stack: MySQL + backend + frontend + Prometheus + Grafana + exporters.
+#   cp .env.example .env   (edit values)   then:   docker compose up --build
+# UI: http://localhost:3000   API: http://localhost:8080   Prometheus: :9090   Grafana: http://localhost:3001
+# NOTE: MySQL runs as a container ONLY for local development. In production the DB is AWS RDS
+# (see docker-compose.prod.yml).
+name: todoapp
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: todo-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: todo_db
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+
+  backend:
+    build:
+      context: ./Backend/todo-summary-assistant
+    container_name: todo-backend
+    restart: unless-stopped
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/todo_db
+      SPRING_DATASOURCE_USERNAME: root
+      SPRING_DATASOURCE_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      JAVA_OPTS: ${JAVA_OPTS:--XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError}
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    logging: *default-logging
+
+  frontend:
+    build:
+      context: ./Frontend/todo
+    container_name: todo-frontend
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:8080
+    ports:
+      - "3000:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *default-logging
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: todo-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: todo-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/todo-overview.json:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    logging: *default-logging
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: todo-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|var/lib/containerd/.+)($$|/)
+    pid: host
+    volumes:
+      - /:/host:ro
+    logging: *default-logging
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: todo-cadvisor
+    restart: unless-stopped
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=30s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    devices:
+      - /dev/kmsg
+    logging: *default-logging
+
+volumes:
+  mysql-data:
+  prometheus-data:
+  grafana-data:

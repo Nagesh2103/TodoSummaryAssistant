@@ -1,0 +1,27 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
+scrape_configs:
+  # Spring Boot application metrics (Actuator + Micrometer)
+  - job_name: todo-backend
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["backend:8080"]
+
+  # Host metrics (CPU, memory, disk)
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Container metrics (restarts, uptime, per-container CPU/memory)
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

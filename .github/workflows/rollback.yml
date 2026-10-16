@@ -1,0 +1,49 @@
+name: Rollback / redeploy a previous version
+
+# Manual one-click rollback: redeploys any image tag that already exists in ECR.
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag (12-char commit SHA) to deploy, e.g. a previously healthy release"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Verify the tag exists in ECR (both images)
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          for repo in todo-backend todo-frontend; do
+            aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$IMAGE_TAG" >/dev/null
+          done
+      - name: Deploy
+        run: scripts/ssm-deploy.sh "$IMAGE_TAG"
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          DEPLOY_BUCKET: ${{ secrets.DEPLOY_BUCKET }}
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+      - name: External smoke test
+        run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors --max-time 10 "${APP_URL}/healthz" | grep -q '"status":"UP"'
+        env:
+          APP_URL: ${{ secrets.APP_URL }}

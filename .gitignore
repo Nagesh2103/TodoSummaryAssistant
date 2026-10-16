@@ -1,0 +1,18 @@
+# secrets / local env
+.env
+*.pem
+*.tfvars
+!*.tfvars.example
+# terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl.bak
+# build output
+node_modules/
+build/
+target/
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store

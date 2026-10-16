@@ -1,0 +1,196 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+
+jobs:
+  # ---------------------------------------------------------------- Stage 1
+  backend-test:
+    name: Backend - build & test (Maven)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Backend/todo-summary-assistant
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+      - name: Compile, run unit + integration tests, package
+        run: mvn -B verify
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-reports
+          path: Backend/todo-summary-assistant/target/surefire-reports
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- Stage 1 (parallel)
+  frontend-test:
+    name: Frontend - test & build (React)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Frontend/todo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: Frontend/todo/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Unit tests
+        run: npm test -- --watchAll=false
+        env:
+          CI: "true"
+      - name: Production build
+        run: npm run build
+        env:
+          CI: "false"   # existing source has a lint *warning*; tests above are the gate
+
+  # ---------------------------------------------------------------- Stage 1 (parallel)
+  validate-config:
+    name: Validate Docker / monitoring / scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck deploy scripts
+        run: shellcheck scripts/*.sh
+      - name: Hadolint Dockerfiles
+        run: |
+          docker run --rm -i hadolint/hadolint hadolint --ignore DL3018 - < Backend/todo-summary-assistant/Dockerfile
+          docker run --rm -i hadolint/hadolint hadolint --ignore DL3018 - < Frontend/todo/Dockerfile
+      - name: Validate compose files
+        run: |
+          MYSQL_ROOT_PASSWORD=x GRAFANA_ADMIN_PASSWORD=x docker compose -f docker-compose.yml config -q
+          ECR_REGISTRY=r IMAGE_TAG=t SPRING_DATASOURCE_URL=u SPRING_DATASOURCE_USERNAME=u \
+            SPRING_DATASOURCE_PASSWORD=p GF_SECURITY_ADMIN_PASSWORD=x \
+            docker compose -f docker-compose.prod.yml config -q
+      - name: promtool - Prometheus config and alert rules
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD/monitoring:/m:ro" prom/prometheus:v2.55.1 \
+            check rules /m/alert-rules.yml
+          # prometheus.yml references /etc/prometheus/alert-rules.yml, so mount both there
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+            -v "$PWD/monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro" \
+            prom/prometheus:v2.55.1 check config /etc/prometheus/prometheus.yml
+      - name: promtool - alert rule unit tests
+        run: |
+          docker run --rm --entrypoint promtool -v "$PWD/monitoring:/m:ro" -w /m prom/prometheus:v2.55.1 \
+            test rules alert-rules.test.yml
+      - name: Grafana dashboard is valid JSON
+        run: jq -e '.panels | length > 0' monitoring/grafana-dashboard.json
+      - name: No secrets committed (gitleaks)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect --source /repo --no-git --redact --exit-code 1
+
+  # ---------------------------------------------------------------- Stage 2
+  docker-build-check:
+    name: Docker build (no push) on pull requests
+    if: github.event_name == 'pull_request'
+    needs: [backend-test, frontend-test, validate-config]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: Backend/todo-summary-assistant
+          push: false
+          cache-from: type=gha,scope=backend
+      - uses: docker/build-push-action@v6
+        with:
+          context: Frontend/todo
+          push: false
+          cache-from: type=gha,scope=frontend
+
+  # ---------------------------------------------------------------- Stage 3
+  build-and-push:
+    name: Build images & push to ECR
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [backend-test, frontend-test, validate-config]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # OIDC -> short-lived AWS credentials, no stored AWS keys
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: Backend/todo-summary-assistant
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/todo-backend:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+      - name: Build & push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: Frontend/todo
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/todo-frontend:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+  # ---------------------------------------------------------------- Stage 4
+  deploy:
+    name: Deploy to EC2 (SSM) & health check
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Deploy through SSM Run Command (auto-rollback on failed health check)
+        run: scripts/ssm-deploy.sh "$IMAGE_TAG"
+        env:
+          DEPLOY_BUCKET: ${{ secrets.DEPLOY_BUCKET }}
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+      - name: External smoke test (public endpoint)
+        run: |
+          curl -fsS --retry 10 --retry-delay 6 --retry-all-errors --max-time 10 "${APP_URL}/healthz" | tee /dev/stderr | grep -q '"status":"UP"'
+          curl -fsS --max-time 10 -o /dev/null "${APP_URL}/"
+          curl -fsS --max-time 10 -o /dev/null "${APP_URL}/api/todos"
+        env:
+          APP_URL: ${{ secrets.APP_URL }}

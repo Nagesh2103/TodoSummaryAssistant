@@ -1,0 +1,118 @@
+# Production stack on the EC2 instance. Deployed by scripts/deploy.sh (never run by hand
+# without the exported variables). The database is AWS RDS - there is NO mysql container here.
+#
+# Required variables (exported by scripts/deploy.sh from SSM Parameter Store / Secrets Manager):
+#   ECR_REGISTRY, IMAGE_TAG, SPRING_DATASOURCE_URL/USERNAME/PASSWORD,
+#   COHERE_API_KEY, SLACK_WEBHOOK_URL, GF_SECURITY_ADMIN_PASSWORD
+name: todoapp
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  backend:
+    image: ${ECR_REGISTRY:?}/todo-backend:${IMAGE_TAG:?}
+    container_name: todo-backend
+    restart: unless-stopped
+    environment:
+      SPRING_DATASOURCE_URL: ${SPRING_DATASOURCE_URL:?}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:?}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:?}
+      COHERE_API_KEY: ${COHERE_API_KEY:-}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      JAVA_OPTS: -XX:MaxRAMPercentage=65 -XX:+ExitOnOutOfMemoryError
+    # No published port: only the frontend (nginx) and Prometheus reach it over the compose network
+    expose:
+      - "8080"
+    mem_limit: 640m
+    logging: *default-logging
+
+  frontend:
+    image: ${ECR_REGISTRY:?}/todo-frontend:${IMAGE_TAG:?}
+    container_name: todo-frontend
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:8080
+    ports:
+      - "80:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    mem_limit: 64m
+    logging: *default-logging
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: todo-prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus-data:/prometheus
+    # Loopback only: reach it through an SSM/SSH port-forward or via Grafana
+    ports:
+      - "127.0.0.1:9090:9090"
+    mem_limit: 256m
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: todo-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:?}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/todo-overview.json:ro
+      - grafana-data:/var/lib/grafana
+    # Security group restricts :3000 to the admin IP
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    mem_limit: 256m
+    logging: *default-logging
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: todo-node-exporter
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+|var/lib/containerd/.+)($$|/)
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+    mem_limit: 64m
+    logging: *default-logging
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: todo-cadvisor
+    restart: unless-stopped
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=30s
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    devices:
+      - /dev/kmsg
+    mem_limit: 128m
+    logging: *default-logging
+
+volumes:
+  prometheus-data:
+  grafana-data:
